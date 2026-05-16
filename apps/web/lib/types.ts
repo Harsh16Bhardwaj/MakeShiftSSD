@@ -13,6 +13,12 @@ export type DirectoryListing = {
   items: FileItem[];
 };
 
+export type SearchResponse = {
+  query: string;
+  items: FileItem[];
+  total: number;
+};
+
 export type MutationResponse = {
   path: string;
   message: string;

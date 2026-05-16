@@ -114,6 +114,26 @@ select {
   pointer-events: none;
 }
 
+.pc-desktop[data-motion="slow"] {
+  animation-duration: 42s;
+}
+
+.pc-desktop[data-motion="slow"]::before {
+  animation-duration: 84s;
+}
+
+.pc-desktop[data-motion="off"],
+.pc-desktop[data-motion="off"]::before {
+  animation: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pc-desktop,
+  .pc-desktop::before {
+    animation: none;
+  }
+}
+
 @keyframes pc-drift {
   from {
     background-position: 0% 30%, 100% 20%, center;

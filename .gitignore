@@ -11,6 +11,8 @@ node_modules/
 .next/
 out/
 
+/ARCHITECTURE.md
+/AGENTS.md
 # Local runtime state
 .env
 .env.*

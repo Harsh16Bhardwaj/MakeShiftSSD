@@ -24,6 +24,7 @@ from app.schemas import (
     MutationResponse,
     PreviewInfo,
     RenameRequest,
+    SearchResponse,
 )
 from app.storage import (
     StoragePathError,
@@ -38,6 +39,9 @@ from app.storage import (
 
 logger = logging.getLogger("personalcloud.storage")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+
+_DIRECTORY_CACHE: dict[tuple[str, str], DirectoryListing] = {}
+_SEARCH_INDEX_CACHE: dict[str, list[FileItem]] = {}
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -78,6 +82,10 @@ def health() -> HealthResponse:
 def list_directory(path: str = Query(default="")) -> DirectoryListing:
     settings = get_settings()
     root = ensure_storage_root(settings.resolved_storage_root)
+    cache_key = (str(root), path)
+
+    if cache_key in _DIRECTORY_CACHE:
+        return _DIRECTORY_CACHE[cache_key]
 
     try:
         directory = safe_join(root, path)
@@ -96,7 +104,31 @@ def list_directory(path: str = Query(default="")) -> DirectoryListing:
         for child in sorted(directory.iterdir(), key=_sort_key)
         if not (directory == root and child.name == settings.trash_dir)
     ]
-    return DirectoryListing(path=to_api_path(root, directory), items=items)
+    listing = DirectoryListing(path=to_api_path(root, directory), items=items)
+    _DIRECTORY_CACHE[cache_key] = listing
+    return listing
+
+
+@api.get("/files/search", response_model=SearchResponse)
+def search_files(query: str = Query(min_length=1), limit: int = Query(default=80, ge=1, le=250)) -> SearchResponse:
+    settings = get_settings()
+    root = ensure_storage_root(settings.resolved_storage_root)
+    normalized_query = query.strip().lower()
+
+    if not normalized_query:
+        return SearchResponse(query=query, items=[], total=0)
+
+    index = _SEARCH_INDEX_CACHE.get(str(root))
+    if index is None:
+        index = _build_search_index(root, settings.trash_dir)
+        _SEARCH_INDEX_CACHE[str(root)] = index
+
+    matches = [
+        item
+        for item in index
+        if normalized_query in item.name.lower() or normalized_query in item.path.lower()
+    ]
+    return SearchResponse(query=query, items=matches[:limit], total=len(matches))
 
 
 @api.post("/folders", status_code=201, response_model=MutationResponse)
@@ -114,6 +146,7 @@ def create_folder(request: CreateFolderRequest) -> MutationResponse:
         raise HTTPException(status_code=409, detail="Folder already exists")
 
     target.mkdir()
+    _invalidate_metadata_cache(root)
     logger.info("folder created path=%s", to_api_path(root, target))
     return MutationResponse(path=to_api_path(root, target), message="Folder created")
 
@@ -138,6 +171,7 @@ async def upload_file(parent_path: str = Form(default=""), file: UploadFile = Fi
     finally:
         await file.close()
 
+    _invalidate_metadata_cache(root)
     logger.info("file uploaded path=%s", to_api_path(root, target))
     return MutationResponse(path=to_api_path(root, target), message="File uploaded")
 
@@ -237,6 +271,7 @@ def rename_item(request: RenameRequest) -> MutationResponse:
         raise HTTPException(status_code=409, detail="Destination already exists")
 
     source.rename(target)
+    _invalidate_metadata_cache(root)
     logger.info("item renamed source=%s target=%s", request.path, to_api_path(root, target))
     return MutationResponse(path=to_api_path(root, target), message="Item renamed")
 
@@ -263,6 +298,7 @@ def copy_items(request: BulkFileOperationRequest) -> BulkMutationResponse:
             shutil.copy2(source, target)
         copied_paths.append(to_api_path(root, target))
 
+    _invalidate_metadata_cache(root)
     logger.info(
         "items copied count=%s destination=%s",
         len(copied_paths),
@@ -290,6 +326,7 @@ def move_items(request: BulkFileOperationRequest) -> BulkMutationResponse:
         shutil.move(str(source), str(target))
         moved_paths.append(to_api_path(root, target))
 
+    _invalidate_metadata_cache(root)
     logger.info(
         "items moved count=%s destination=%s",
         len(moved_paths),
@@ -309,6 +346,7 @@ def trash_item(path: str = Query()) -> MutationResponse:
     target = build_trash_path(trash, source)
     shutil.move(str(source), str(target))
 
+    _invalidate_metadata_cache(root)
     logger.info("item moved to trash source=%s trash=%s", path, to_api_path(root, target))
     return MutationResponse(path=to_api_path(root, target), message="Item moved to trash")
 
@@ -326,6 +364,28 @@ def _build_file_item(root: Path, item: Path) -> FileItem:
 
 def _sort_key(path: Path) -> tuple[int, str]:
     return (0 if path.is_dir() else 1, path.name.lower())
+
+
+def _build_search_index(root: Path, trash_dir: str) -> list[FileItem]:
+    trash_path = safe_join(root, trash_dir)
+    items: list[FileItem] = []
+
+    for child in root.rglob("*"):
+        try:
+            if child == trash_path or trash_path in child.parents:
+                continue
+            items.append(_build_file_item(root, child))
+        except (OSError, ValueError):
+            logger.warning("skipped unindexable path path=%s", child)
+
+    return sorted(items, key=lambda item: (0 if item.kind == "directory" else 1, item.path.lower()))
+
+
+def _invalidate_metadata_cache(root: Path) -> None:
+    root_key = str(root)
+    for key in [key for key in _DIRECTORY_CACHE if key[0] == root_key]:
+        del _DIRECTORY_CACHE[key]
+    _SEARCH_INDEX_CACHE.pop(root_key, None)
 
 
 def _preview_info(path: Path) -> PreviewInfo:

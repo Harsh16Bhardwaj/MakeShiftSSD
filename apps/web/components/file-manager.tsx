@@ -31,6 +31,7 @@ import {
   MoreVertical,
   Pencil,
   RefreshCcw,
+  Search,
   Scissors,
   Sun,
   TableProperties,
@@ -38,13 +39,14 @@ import {
   Upload,
   X,
 } from "lucide-react";
-import type { ApiError, DirectoryListing, FileItem, PreviewInfo } from "@/lib/types";
+import type { ApiError, DirectoryListing, FileItem, PreviewInfo, SearchResponse } from "@/lib/types";
 
 type BusyState = "idle" | "loading" | "mutating";
 type ThemeMode = "light" | "dark";
 type SortMode = "name" | "type" | "modified" | "size";
 type ViewMode = "grid" | "compact" | "details";
 type SmartFilter = "all" | "images" | "videos" | "audio" | "documents";
+type BackgroundMotion = "full" | "slow" | "off";
 type ClipboardState = { mode: "copy" | "cut"; items: FileItem[] } | null;
 type UploadState = { id: string; name: string; progress: number; status: "queued" | "uploading" | "done" | "error"; error?: string };
 type DeleteDialogState = { items: FileItem[] } | null;
@@ -87,7 +89,12 @@ export function FileManager() {
   const [showShortcuts, setShowShortcuts] = useState(false);
   const [showBackgrounds, setShowBackgrounds] = useState(false);
   const [backgroundImage, setBackgroundImage] = useState("");
+  const [backgroundMotion, setBackgroundMotion] = useState<BackgroundMotion>("full");
   const [deleteDialog, setDeleteDialog] = useState<DeleteDialogState>(null);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchResults, setSearchResults] = useState<FileItem[]>([]);
+  const [searchTotal, setSearchTotal] = useState(0);
+  const [isSearching, setIsSearching] = useState(false);
 
   useEffect(() => {
     const savedTheme = window.localStorage.getItem("personalcloud-theme");
@@ -97,6 +104,10 @@ export function FileManager() {
     const savedBackground = window.localStorage.getItem("personalcloud-background-image");
     if (savedBackground) {
       setBackgroundImage(savedBackground);
+    }
+    const savedMotion = window.localStorage.getItem("personalcloud-background-motion");
+    if (savedMotion === "full" || savedMotion === "slow" || savedMotion === "off") {
+      setBackgroundMotion(savedMotion);
     }
   }, []);
 
@@ -112,6 +123,48 @@ export function FileManager() {
       window.localStorage.removeItem("personalcloud-background-image");
     }
   }, [backgroundImage]);
+
+  useEffect(() => {
+    window.localStorage.setItem("personalcloud-background-motion", backgroundMotion);
+  }, [backgroundMotion]);
+
+  useEffect(() => {
+    const query = searchQuery.trim();
+    if (!isWindowOpen || query.length < 2) {
+      setSearchResults([]);
+      setSearchTotal(0);
+      setIsSearching(false);
+      return;
+    }
+
+    const controller = new AbortController();
+    const timeout = window.setTimeout(async () => {
+      setIsSearching(true);
+      const response = await fetch(`/api/storage/search?query=${encodeURIComponent(query)}`, {
+        cache: "no-store",
+        signal: controller.signal,
+      }).catch(() => null);
+
+      if (!response || !response.ok) {
+        if (!controller.signal.aborted) {
+          setSearchResults([]);
+          setSearchTotal(0);
+          setIsSearching(false);
+        }
+        return;
+      }
+
+      const data = (await response.json()) as SearchResponse;
+      setSearchResults(data.items);
+      setSearchTotal(data.total);
+      setIsSearching(false);
+    }, 250);
+
+    return () => {
+      controller.abort();
+      window.clearTimeout(timeout);
+    };
+  }, [isWindowOpen, searchQuery]);
 
   useEffect(() => {
     if (!isWindowOpen) return;
@@ -134,9 +187,13 @@ export function FileManager() {
   const breadcrumbs = useMemo(() => buildBreadcrumbs(currentPath), [currentPath]);
   const filteredItems = useMemo(() => filterItems(listing?.items ?? [], smartFilter), [listing?.items, smartFilter]);
   const sortedItems = useMemo(() => sortItems(filteredItems, sortMode), [filteredItems, sortMode]);
+  const displayedItems = useMemo(
+    () => (searchQuery.trim().length >= 2 ? sortItems(searchResults, sortMode) : sortedItems),
+    [searchQuery, searchResults, sortedItems, sortMode],
+  );
   const selectedItems = useMemo(
-    () => sortedItems.filter((item) => selectedPaths.has(item.path)),
-    [selectedPaths, sortedItems],
+    () => displayedItems.filter((item) => selectedPaths.has(item.path)),
+    [selectedPaths, displayedItems],
   );
   const canGoBack = historyIndex > 0;
   const canGoForward = historyIndex < history.length - 1;
@@ -171,6 +228,7 @@ export function FileManager() {
     setPreview(null);
     setMenu(null);
     setSmartFilter("all");
+    setSearchQuery("");
     clearSelection();
     setHistory((previous) => {
       const next = previous.slice(0, historyIndex + 1);
@@ -444,7 +502,7 @@ export function FileManager() {
   }
 
   function selectAll() {
-    setSelectedPaths(new Set(sortedItems.map((item) => item.path)));
+    setSelectedPaths(new Set(displayedItems.map((item) => item.path)));
   }
 
   function showToast(message: string) {
@@ -501,6 +559,7 @@ export function FileManager() {
   return (
     <main
       className="pc-desktop min-h-screen overflow-hidden"
+      data-motion={backgroundMotion}
       style={
         backgroundImage
           ? {
@@ -570,7 +629,10 @@ export function FileManager() {
             selectedPaths={selectedPaths}
             smartFilter={smartFilter}
             sortMode={sortMode}
-            sortedItems={sortedItems}
+            searchQuery={searchQuery}
+            searchTotal={searchTotal}
+            isSearching={isSearching}
+            sortedItems={displayedItems}
             uploadQueue={uploadQueue}
             viewMode={viewMode}
             onBack={goBack}
@@ -594,6 +656,7 @@ export function FileManager() {
             onSelect={selectItem}
             onSelectAll={selectAll}
             onSetClipboard={setClipboardFromSelection}
+            onSearchChange={setSearchQuery}
             onSmartFilterChange={setSmartFilter}
             onSortChange={setSortMode}
             onUploadDismiss={(id) => setUploadQueue((previous) => previous.filter((upload) => upload.id !== id))}
@@ -639,10 +702,12 @@ export function FileManager() {
         <ShortcutsDialog open={showShortcuts} onClose={() => setShowShortcuts(false)} />
         <BackgroundDialog
           backgroundImage={backgroundImage}
+          backgroundMotion={backgroundMotion}
           open={showBackgrounds}
           onChooseImage={() => backgroundInputRef.current?.click()}
           onClear={() => setBackgroundImage("")}
           onClose={() => setShowBackgrounds(false)}
+          onMotionChange={setBackgroundMotion}
         />
         <DeleteDialog
           state={deleteDialog}
@@ -669,6 +734,9 @@ function ExplorerWindow(props: {
   preview: PreviewState | null;
   selectedItems: FileItem[];
   selectedPaths: Set<string>;
+  searchQuery: string;
+  searchTotal: number;
+  isSearching: boolean;
   smartFilter: SmartFilter;
   sortMode: SortMode;
   sortedItems: FileItem[];
@@ -695,6 +763,7 @@ function ExplorerWindow(props: {
   onSelect: (item: FileItem, additive: boolean) => void;
   onSelectAll: () => void;
   onSetClipboard: (mode: "copy" | "cut", fallback?: FileItem) => void;
+  onSearchChange: (query: string) => void;
   onSmartFilterChange: (filter: SmartFilter) => void;
   onSortChange: (mode: SortMode) => void;
   onUploadDismiss: (id: string) => void;
@@ -707,9 +776,9 @@ function ExplorerWindow(props: {
     <section
       tabIndex={0}
       onKeyDown={props.onKeyDown}
-      className="absolute left-1/2 top-[52%] flex h-[78vh] w-[min(1180px,calc(100vw-32px))] -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-2xl border border-[color:var(--pc-border)] bg-[color:var(--pc-window)] shadow-2xl outline-none backdrop-blur-xl"
+      className="absolute left-1/2 top-[52%] flex h-[84vh] w-[min(1320px,calc(100vw-24px))] -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-2xl border border-[color:var(--pc-border)] bg-[color:var(--pc-window)] shadow-2xl outline-none backdrop-blur-xl"
     >
-      <div className="flex items-center justify-between border-b border-[color:var(--pc-border)] px-4 py-3">
+      <div className="flex items-center justify-between border-b border-[color:var(--pc-border)] px-4 py-2">
         <div className="flex items-center gap-2">
           <button type="button" onClick={props.onClose} className="h-3.5 w-3.5 rounded-full bg-red-500" aria-label="Close" />
           <button type="button" onClick={props.onMinimize} className="h-3.5 w-3.5 rounded-full bg-yellow-400" aria-label="Minimize" />
@@ -735,7 +804,7 @@ function ExplorerWindow(props: {
         </div>
       </div>
 
-      <div className="flex items-center gap-2 border-b border-[color:var(--pc-border)] px-4 py-3">
+      <div className="flex items-center gap-2 border-b border-[color:var(--pc-border)] px-4 py-2">
         <DesktopButton label="Back" onClick={props.onBack} disabled={!props.canGoBack}>
           <ArrowLeft className="h-4 w-4" />
         </DesktopButton>
@@ -759,6 +828,25 @@ function ExplorerWindow(props: {
             </div>
           ))}
         </div>
+        <label className="flex w-[min(320px,28vw)] items-center gap-2 rounded-xl border border-[color:var(--pc-border)] bg-[color:var(--pc-path)] px-3 py-2 text-sm">
+          <Search className="h-4 w-4 shrink-0 text-[color:var(--pc-muted)]" />
+          <input
+            value={props.searchQuery}
+            onChange={(event) => props.onSearchChange(event.target.value)}
+            className="min-w-0 flex-1 bg-transparent text-[color:var(--pc-text)] outline-none placeholder:text-[color:var(--pc-muted)]"
+            placeholder="Search all files"
+          />
+          {props.searchQuery ? (
+            <button
+              type="button"
+              onClick={() => props.onSearchChange("")}
+              className="grid h-5 w-5 place-items-center rounded text-[color:var(--pc-muted)] hover:bg-[color:var(--pc-hover)] hover:text-[color:var(--pc-text)]"
+              aria-label="Clear search"
+            >
+              <X className="h-3 w-3" />
+            </button>
+          ) : null}
+        </label>
         <DesktopButton label="Upload here" onClick={props.onUploadClick}>
           <Upload className="h-4 w-4" />
         </DesktopButton>
@@ -807,9 +895,15 @@ function ExplorerWindow(props: {
             onSelect={props.onSelect}
           />
 
+          {props.searchQuery.trim().length >= 2 ? (
+            <p className="mb-4 text-xs text-[color:var(--pc-muted)]">
+              {props.isSearching ? "Searching..." : `${props.searchTotal} result${props.searchTotal === 1 ? "" : "s"} for "${props.searchQuery}"`}
+            </p>
+          ) : null}
+
           {!props.sortedItems.length && props.busyState !== "loading" ? (
             <div className="grid h-full min-h-[240px] place-items-center text-sm text-[color:var(--pc-muted)]">
-              This view is empty. Right-click to upload or create a folder.
+              {props.searchQuery.trim().length >= 2 ? "No matching files or folders." : "This view is empty. Right-click to upload or create a folder."}
             </div>
           ) : null}
         </div>
@@ -1132,7 +1226,7 @@ function ContextMenu({
   return (
     <div
       className="fixed z-50 w-60 overflow-hidden rounded-xl border border-[color:var(--pc-border)] bg-[color:var(--pc-menu)] p-1 text-sm shadow-2xl backdrop-blur-xl"
-      style={{ left: Math.min(menu.x, globalThis.window?.innerWidth ? window.innerWidth - 260 : menu.x), top: Math.min(menu.y, globalThis.window?.innerHeight ? window.innerHeight - 360 : menu.y) }}
+      style={clampedMenuStyle(menu.x, menu.y)}
       onClick={(event) => event.stopPropagation()}
     >
       {item ? (
@@ -1399,16 +1493,20 @@ function ShortcutKey({ value, label }: { value: string; label: string }) {
 
 function BackgroundDialog({
   backgroundImage,
+  backgroundMotion,
   open,
   onChooseImage,
   onClear,
   onClose,
+  onMotionChange,
 }: {
   backgroundImage: string;
+  backgroundMotion: BackgroundMotion;
   open: boolean;
   onChooseImage: () => void;
   onClear: () => void;
   onClose: () => void;
+  onMotionChange: (motion: BackgroundMotion) => void;
 }) {
   if (!open) return null;
   return (
@@ -1429,6 +1527,25 @@ function BackgroundDialog({
           <button type="button" onClick={onClear} className="rounded-xl border border-[color:var(--pc-border)] bg-[color:var(--pc-button)] px-4 py-2.5 text-sm font-semibold hover:bg-[color:var(--pc-hover)]">
             Use default
           </button>
+        </div>
+        <div>
+          <p className="mb-2 text-xs font-semibold uppercase tracking-[0.14em] text-[color:var(--pc-muted)]">Motion</p>
+          <div className="grid grid-cols-3 gap-2">
+            {(["full", "slow", "off"] as BackgroundMotion[]).map((motion) => (
+              <button
+                key={motion}
+                type="button"
+                onClick={() => onMotionChange(motion)}
+                className={`rounded-xl border px-3 py-2 text-sm font-semibold capitalize transition ${
+                  backgroundMotion === motion
+                    ? "border-blue-400/70 bg-blue-500/20 text-blue-100"
+                    : "border-[color:var(--pc-border)] bg-[color:var(--pc-button)] hover:bg-[color:var(--pc-hover)]"
+                }`}
+              >
+                {motion}
+              </button>
+            ))}
+          </div>
         </div>
       </div>
     </DialogFrame>
@@ -1675,9 +1792,29 @@ function capitalize(value: string) {
 
 function menuPositionFromElement(element: EventTarget & Element) {
   const rect = element.getBoundingClientRect();
+  const menuWidth = 240;
+  const menuHeight = 360;
+  const viewportWidth = window.innerWidth;
+  const viewportHeight = window.innerHeight;
+  const hasSpaceRight = rect.right + menuWidth + 12 < viewportWidth;
+  const hasSpaceBelow = rect.top + menuHeight < viewportHeight - 12;
+
   return {
-    x: rect.right + 8,
-    y: rect.top,
+    x: hasSpaceRight ? rect.right + 8 : rect.left - menuWidth - 8,
+    y: hasSpaceBelow ? rect.top : rect.bottom - menuHeight,
+  };
+}
+
+function clampedMenuStyle(x: number, y: number) {
+  const menuWidth = 240;
+  const menuHeight = 360;
+  if (typeof window === "undefined") {
+    return { left: x, top: y };
+  }
+
+  return {
+    left: Math.max(8, Math.min(x, window.innerWidth - menuWidth - 8)),
+    top: Math.max(8, Math.min(y, window.innerHeight - menuHeight - 8)),
   };
 }
 

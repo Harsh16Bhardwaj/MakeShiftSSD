@@ -384,3 +384,13 @@ Default protocol notes:
 - Added folder archive download through FastAPI `GET /api/files/archive` and a Next.js BFF proxy route.
 - Kept folder archive generation server-side so compression respects storage-root validation and does not expose filesystem paths to the browser.
 - Positioned three-dot context menus from the clicked button geometry so menus open beside the selected file/folder instead of far away.
+
+### 2026-05-16: Metadata Cache, Search Index, And Explorer Accessibility
+
+- Added an in-memory FastAPI metadata cache for directory listings keyed by storage root and requested path.
+- Added a simple FastAPI search index built from filesystem metadata and invalidated after upload, folder create, rename, copy, move, and trash operations.
+- Added a Next.js BFF search route so the browser still does not call FastAPI directly.
+- Added explorer top-bar search across files and folders using the backend index.
+- Increased the explorer size and reduced title/navigation bar height to give the file area more room.
+- Added background motion controls with full, slow, and off modes, plus CSS respect for `prefers-reduced-motion`.
+- Improved context menu placement with viewport-aware clamping/flipping so menus stay reachable near lower screen edges.

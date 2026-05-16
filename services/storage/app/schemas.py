@@ -24,6 +24,12 @@ class DirectoryListing(BaseModel):
     items: list[FileItem]
 
 
+class SearchResponse(BaseModel):
+    query: str
+    items: list[FileItem]
+    total: int
+
+
 class CreateFolderRequest(BaseModel):
     parent_path: str = ""
     name: str

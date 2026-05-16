@@ -60,6 +60,54 @@ def test_list_directory_returns_directories_before_files(tmp_path: Path, monkeyp
     assert data["items"][1]["kind"] == "file"
 
 
+def test_search_finds_nested_files_and_directories(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("PERSONALCLOUD_STORAGE_ROOT", str(tmp_path))
+    get_settings.cache_clear()
+    (tmp_path / "photos").mkdir()
+    (tmp_path / "photos" / "summer-photo.jpg").write_bytes(b"image")
+
+    response = TestClient(app).get(
+        "/api/files/search",
+        params={"query": "photo"},
+        headers=AUTH_HEADERS,
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] == 2
+    assert [item["path"] for item in data["items"]] == ["photos", "photos/summer-photo.jpg"]
+
+
+def test_search_index_invalidates_after_upload(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("PERSONALCLOUD_STORAGE_ROOT", str(tmp_path))
+    get_settings.cache_clear()
+    client = TestClient(app)
+
+    first_search = client.get(
+        "/api/files/search",
+        params={"query": "new-note"},
+        headers=AUTH_HEADERS,
+    )
+    assert first_search.status_code == 200
+    assert first_search.json()["total"] == 0
+
+    upload_response = client.post(
+        "/api/files/upload",
+        data={"parent_path": ""},
+        files={"file": ("new-note.txt", b"hello", "text/plain")},
+        headers=AUTH_HEADERS,
+    )
+    assert upload_response.status_code == 201
+
+    second_search = client.get(
+        "/api/files/search",
+        params={"query": "new-note"},
+        headers=AUTH_HEADERS,
+    )
+    assert second_search.status_code == 200
+    assert second_search.json()["total"] == 1
+
+
 def test_list_directory_rejects_unsafe_path(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("PERSONALCLOUD_STORAGE_ROOT", str(tmp_path))
     get_settings.cache_clear()
