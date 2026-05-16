@@ -1,123 +1,82 @@
 # PersonalCloud
 
-PersonalCloud is a private cloud project for turning a secondary Windows PC into a secure storage server reachable from trusted devices over Tailscale.
+PersonalCloud turns a secondary Windows PC into a private personal cloud server. It exposes one controlled storage root through a FastAPI filesystem service and a Next.js browser UI, designed to be reached from trusted devices over Tailscale without public port forwarding.
 
-The project is intentionally structured as a monorepo: one repository contains the FastAPI storage service, the future Next.js web app, Windows automation scripts, and architecture documentation. This keeps cross-service decisions, setup, and handoffs in one place while still allowing each tech stack to have its own tooling.
+The project is intentionally built as a resume-worthy full-stack infrastructure system: secure file boundaries, streaming downloads/previews, a BFF layer, metadata caching, search indexing, desktop-style UX, and future watchdog/cloud-ingestion work.
 
-## Current Status
+## Current Capabilities
 
-- Docs foundation exists in `AGENTS.md`, `ROADMAP.md`, and `ARCHITECTURE.md`.
-- FastAPI storage service scaffold exists in `services/storage`.
-- Next.js file manager exists in `apps/web`.
-- Future cloud inbox is documented as a later manual chunk upload feature, not current v1 behavior.
+- Single-admin login with signed HTTP-only session cookie.
+- Next.js BFF routes hide the FastAPI internal token from the browser.
+- FastAPI storage service owns all trusted filesystem operations.
+- One configured storage root only; no arbitrary machine-wide browsing.
+- Folder listing, create folder, multi-file upload, download, rename, copy, move, and soft delete.
+- Folder compression and ZIP download.
+- Browser-native previews for images, video, audio, PDF, and text/code files.
+- FastAPI-owned preview metadata and text preview size limit.
+- Finder-style file manager with dark mode, sidebar, grid/compact/details views, multi-select, keyboard shortcuts, context menus, and upload queue.
+- Image thumbnails through authenticated preview routes.
+- In-memory directory metadata cache and search index with mutation invalidation.
+- Future cloud inbox design documented for manual chunk uploads through Cloudflare R2.
 
-## Why No External DB Yet
+## Repository Layout
 
-V1 uses the filesystem as the source of truth. Files are stored under one configured storage root, and metadata is read from disk.
-
-SQLite may be added later for durable audit logs, cached indexes, trash manifests, backup state, or search metadata. A networked external database is intentionally avoided for v1 because this project should work as a local appliance on the secondary PC.
-
-## Future Cloud Inbox
-
-Large remote uploads will eventually use a manual chunk protocol:
-
-- Browser splits a file into chunks.
-- Browser hashes each chunk.
-- Browser uploads chunk objects to Cloudflare R2.
-- Browser publishes a manifest.
-- The secondary PC worker downloads chunks, verifies hashes, reassembles in staging, verifies the final file, and atomically commits into local storage.
-
-This is future work. Cloud inbox is temporary staging only; the local filesystem remains the source of truth. Cloudinary is intentionally not the general-purpose inbox provider because arbitrary large file relay fits object storage better.
-
-## FastAPI Storage Service
-
-```powershell
-cd D:\PersonalCloud\services\storage
-uv sync
-Copy-Item .env.example .env
-uv run uvicorn app.main:app --reload --host 127.0.0.1 --port 8765
+```text
+D:\PersonalCloud
+  apps/
+    web/                  # Next.js App Router UI and BFF routes
+  services/
+    storage/              # FastAPI trusted filesystem service
+  scripts/
+    windows/              # planned startup/watchdog scripts
+  AGENTS.md               # agent and project operating rules
+  ROADMAP.md              # chunked implementation plan
+  ARCHITECTURE.md         # architecture journal and interview notes
+  README.md
 ```
 
-Set a real local service token in `.env` before running outside quick experiments:
+This is a monorepo: one Git repository contains multiple apps/services that make up one product. Each app keeps its own tooling, while root docs explain how the system fits together.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  User["Primary PC / Mobile Browser"] --> Tailnet["Tailscale private network"]
+  Tailnet --> Web["Next.js UI + BFF"]
+  Web --> API["FastAPI storage service"]
+  API --> Root["Configured storage root"]
+  API --> Cache["Metadata cache + search index"]
+  API --> Trash[".personalcloud-trash"]
+  Web -. "future" .-> R2["Cloudflare R2 inbox"]
+  API -. "future" .-> Watchdog["Windows watchdog"]
+```
+
+Request model:
+
+```text
+Browser
+  -> Next.js route handler
+  -> FastAPI with X-PersonalCloud-Token
+  -> validated path inside storage root
+  -> filesystem operation / stream response
+```
+
+The browser never calls FastAPI directly.
+
+## Environment
+
+Backend: `services/storage/.env`
 
 ```env
+PERSONALCLOUD_STORAGE_ROOT=../../storage-root
+PERSONALCLOUD_TRASH_DIR=.personalcloud-trash
+PERSONALCLOUD_SERVICE_NAME=personalcloud-storage
 PERSONALCLOUD_INTERNAL_API_TOKEN=replace-with-a-long-random-token
+PERSONALCLOUD_ALLOW_INSECURE_API=false
 PERSONALCLOUD_MAX_TEXT_PREVIEW_BYTES=1048576
 ```
 
-Health check:
-
-```powershell
-Invoke-RestMethod http://127.0.0.1:8765/health
-```
-
-List the root folder:
-
-```powershell
-$headers = @{ "X-PersonalCloud-Token" = "replace-with-a-long-random-token" }
-Invoke-RestMethod "http://127.0.0.1:8765/api/files?path=" -Headers $headers
-```
-
-Create a folder:
-
-```powershell
-$body = @{ parent_path = ""; name = "docs" } | ConvertTo-Json
-Invoke-RestMethod "http://127.0.0.1:8765/api/folders" -Method Post -Headers $headers -ContentType "application/json" -Body $body
-```
-
-Upload a file:
-
-```powershell
-curl.exe -X POST "http://127.0.0.1:8765/api/files/upload" `
-  -H "X-PersonalCloud-Token: replace-with-a-long-random-token" `
-  -F "parent_path=docs" `
-  -F "file=@D:\path\to\file.txt"
-```
-
-Download a file:
-
-```powershell
-curl.exe -L "http://127.0.0.1:8765/api/files/download?path=docs/file.txt" `
-  -H "X-PersonalCloud-Token: replace-with-a-long-random-token" `
-  -o file.txt
-```
-
-Rename a file or folder:
-
-```powershell
-$body = @{ path = "docs/file.txt"; new_name = "renamed.txt" } | ConvertTo-Json
-Invoke-RestMethod "http://127.0.0.1:8765/api/files/rename" -Method Patch -Headers $headers -ContentType "application/json" -Body $body
-```
-
-Move an item to trash:
-
-```powershell
-Invoke-RestMethod "http://127.0.0.1:8765/api/files?path=docs/renamed.txt" -Method Delete -Headers $headers
-```
-
-Preview a supported file:
-
-```powershell
-curl.exe -L "http://127.0.0.1:8765/api/files/preview?path=docs/file.txt" `
-  -H "X-PersonalCloud-Token: replace-with-a-long-random-token"
-```
-
-Check preview support before streaming:
-
-```powershell
-Invoke-RestMethod "http://127.0.0.1:8765/api/files/preview-info?path=docs/file.txt" -Headers $headers
-```
-
-## Next.js Web App
-
-```powershell
-cd D:\PersonalCloud\apps\web
-npm install
-Copy-Item .env.example .env.local
-npm run dev
-```
-
-Set matching local tokens in `apps\web\.env.local`:
+Frontend: `apps/web/.env.local`
 
 ```env
 PERSONALCLOUD_ADMIN_TOKEN=replace-with-a-login-token
@@ -126,31 +85,14 @@ PERSONALCLOUD_STORAGE_API_URL=http://127.0.0.1:8765
 PERSONALCLOUD_INTERNAL_API_TOKEN=replace-with-the-same-token-used-by-fastapi
 ```
 
-Open:
-
-```text
-http://127.0.0.1:3000
-```
-
-The browser talks to Next.js only. Next.js proxies storage requests to FastAPI and attaches `X-PersonalCloud-Token` server-side.
-
-The file manager supports browser-native previews for common images, audio, video, PDFs, and text/code files. FastAPI owns preview support decisions through `preview-info`; unsupported files keep the download path available without attempting conversion. Text preview is capped by `PERSONALCLOUD_MAX_TEXT_PREVIEW_BYTES`.
-
-## Local End-To-End Test Guide
-
-Use two different tokens:
+Token roles:
 
 - `PERSONALCLOUD_ADMIN_TOKEN`: typed into the login page.
-- `PERSONALCLOUD_INTERNAL_API_TOKEN`: shared only between Next.js and FastAPI.
+- `PERSONALCLOUD_INTERNAL_API_TOKEN`: server-to-server token used only by Next.js BFF routes and FastAPI.
 
-For local testing, this setup is fine:
+## Run Locally
 
-```env
-PERSONALCLOUD_ADMIN_TOKEN=personalcloud-dev-admin
-PERSONALCLOUD_INTERNAL_API_TOKEN=personalcloud-dev-internal-token
-```
-
-Start FastAPI in one PowerShell:
+Start FastAPI:
 
 ```powershell
 cd D:\PersonalCloud\services\storage
@@ -158,7 +100,7 @@ uv sync
 uv run uvicorn app.main:app --reload --host 127.0.0.1 --port 8765
 ```
 
-Start Next.js in another PowerShell:
+Start Next.js:
 
 ```powershell
 cd D:\PersonalCloud\apps\web
@@ -166,56 +108,103 @@ npm install
 npm run dev
 ```
 
-If Next.js shows a Webpack/RSC runtime error such as `__webpack_modules__[moduleId] is not a function`, clear the generated dev cache and restart:
+Open:
+
+```text
+http://127.0.0.1:3000
+```
+
+For quick local testing, use:
+
+```env
+PERSONALCLOUD_ADMIN_TOKEN=personalcloud-dev-admin
+PERSONALCLOUD_INTERNAL_API_TOKEN=personalcloud-dev-internal-token
+```
+
+If Next.js hits a stale Webpack/RSC cache error, restart cleanly:
 
 ```powershell
 cd D:\PersonalCloud\apps\web
 npm run dev:clean
 ```
 
-Open the app:
+## FastAPI API Surface
 
-```text
-http://127.0.0.1:3000
+All `/api/*` routes require:
+
+```http
+X-PersonalCloud-Token: <PERSONALCLOUD_INTERNAL_API_TOKEN>
 ```
 
-Login with:
+Public watchdog route:
 
-```text
-personalcloud-dev-admin
+```http
+GET /health
 ```
 
-Do not login with `personalcloud-dev-internal-token`; that token is only for server-to-server calls.
+Storage routes:
 
-Functional test checklist:
+```http
+GET    /api/files?path=
+GET    /api/files/search?query=
+POST   /api/folders
+POST   /api/files/upload
+GET    /api/files/download?path=
+GET    /api/files/archive?path=
+GET    /api/files/preview?path=
+GET    /api/files/preview-info?path=
+PATCH  /api/files/rename
+POST   /api/files/copy
+POST   /api/files/move
+DELETE /api/files?path=
+```
 
-1. Login and confirm the page redirects to `/files`.
-2. Create a folder named `docs`.
-3. Upload a small `.txt` file into `docs`.
-4. Click preview and confirm the text appears in the preview panel.
-5. Download the file and confirm the contents match.
-6. Rename the file.
-7. Upload an unsupported file such as `.bin` and confirm preview shows a graceful unsupported message.
-8. Move a file or folder to trash and confirm it disappears from the listing.
-
-Direct login API sanity check:
+Example folder archive:
 
 ```powershell
-@'
-const response = await fetch("http://127.0.0.1:3000/api/session/login", {
-  method: "POST",
-  headers: { "content-type": "application/json" },
-  body: JSON.stringify({ token: "personalcloud-dev-admin" })
-});
-console.log(response.status, await response.text(), response.headers.get("set-cookie"));
-'@ | node
+curl.exe -L "http://127.0.0.1:8765/api/files/archive?path=docs" `
+  -H "X-PersonalCloud-Token: replace-with-a-long-random-token" `
+  -o docs.zip
 ```
 
-Expected result: status `200`, body `{"ok":true}`, and a `personalcloud_session` cookie.
+Example search:
 
-## Verification
+```powershell
+$headers = @{ "X-PersonalCloud-Token" = "replace-with-a-long-random-token" }
+Invoke-RestMethod "http://127.0.0.1:8765/api/files/search?query=photo" -Headers $headers
+```
 
-FastAPI:
+## Next.js Routes
+
+User-facing:
+
+```text
+/login
+/files
+```
+
+BFF routes:
+
+```text
+/api/session/login
+/api/session/logout
+/api/storage/list
+/api/storage/search
+/api/storage/folders
+/api/storage/upload
+/api/storage/download
+/api/storage/archive
+/api/storage/preview
+/api/storage/preview-info
+/api/storage/rename
+/api/storage/copy
+/api/storage/move
+/api/storage/delete
+```
+
+## Test Plan
+
+Backend:
 
 ```powershell
 cd D:\PersonalCloud\services\storage
@@ -223,7 +212,7 @@ uv run pytest
 uv run ruff check .
 ```
 
-Next.js:
+Frontend:
 
 ```powershell
 cd D:\PersonalCloud\apps\web
@@ -231,3 +220,41 @@ npm run typecheck
 npm run lint
 npm run build
 ```
+
+Avoid running `npm run build` while `npm run dev` is actively serving the same `.next` directory. Stop the dev server or run a clean restart if a stale cache appears.
+
+## Manual Demo Flow
+
+1. Login with the admin token.
+2. Open the `Root` desktop folder.
+3. Create a folder.
+4. Upload multiple files.
+5. Preview an image, PDF, and text file.
+6. Use search from the explorer top bar.
+7. Multi-select files with Ctrl/Cmd click.
+8. Copy/cut/paste files between folders.
+9. Compress and download a folder.
+10. Move items to trash through the in-app confirmation modal.
+11. Change the desktop background and motion setting.
+
+## What Is Next
+
+Recommended next chunk: **Trash Restore And Retention**.
+
+Why: soft delete exists, but restore/permanent cleanup is missing. Adding this completes the deletion lifecycle and creates a good reason to introduce durable trash metadata.
+
+Planned next steps:
+
+1. Add a Trash sidebar view.
+2. Store original path and deleted timestamp for trashed items.
+3. Add restore and permanent delete APIs.
+4. Add retention cleanup policy.
+5. Decide whether trash metadata stays JSON-file based or moves to SQLite.
+
+After that:
+
+- Windows startup/watchdog reliability.
+- Tailscale setup and remote-access hardening.
+- Durable SQLite indexing/search/audit trail.
+- Cloudflare R2 manual chunk inbox.
+- One-way backup with `rclone`.

@@ -66,6 +66,231 @@ flowchart LR
 - Atomically moves completed files into the configured storage root.
 - Deletes imported cloud chunks only after local verification succeeds.
 
+## Current Implementation Notes
+
+### Monorepo Boundary
+
+PersonalCloud is one product with two runtimes:
+
+```text
+apps/web
+  Next.js App Router UI
+  BFF route handlers
+  session cookie auth
+
+services/storage
+  FastAPI trusted filesystem API
+  path validation
+  streaming file responses
+  metadata cache and search index
+```
+
+The practical rule is simple: browser code talks to `apps/web`; only server-side Next.js route handlers talk to `services/storage`.
+
+### Path Safety Boundary
+
+The storage root is the strongest security boundary in the system. Every requested path is normalized, joined to the configured root, resolved, and then checked to prove it did not escape.
+
+Key implementation shape in `services/storage/app/storage.py`:
+
+```python
+def safe_join(root: Path, requested_path: str | None) -> Path:
+    resolved_root = root.expanduser().resolve()
+    relative = _normalize_relative_path(requested_path)
+    candidate = (resolved_root / relative).resolve()
+
+    if candidate != resolved_root and resolved_root not in candidate.parents:
+        raise StoragePathError("Path escapes the configured storage root")
+
+    return candidate
+```
+
+This blocks traversal, absolute paths, drive-qualified paths, malformed path segments, and symlink escapes after resolution.
+
+### BFF Token Boundary
+
+The FastAPI token is never exposed to browser JavaScript. Next.js route handlers attach it server-side.
+
+Key implementation shape in `apps/web/lib/storage-api.ts`:
+
+```ts
+export function storageHeaders(extra?: HeadersInit): HeadersInit {
+  return {
+    ...extra,
+    "X-PersonalCloud-Token": requireEnv("PERSONALCLOUD_INTERNAL_API_TOKEN"),
+  };
+}
+```
+
+The browser sees only same-origin routes such as `/api/storage/list`; the BFF forwards to FastAPI with the internal header.
+
+### Session Model
+
+V1 is single-admin. The login token is checked by Next.js, then the app sets a signed HTTP-only cookie.
+
+Theory:
+
+- The admin token is a bootstrap secret, not a user account database.
+- The browser session cookie is signed so the server can verify it without storing session rows.
+- The cookie is HTTP-only so client JavaScript cannot read it.
+
+This is intentionally simpler than OAuth or multi-user accounts because v1 is a private single-owner appliance.
+
+### Directory Metadata Cache
+
+FastAPI currently keeps an in-memory directory listing cache:
+
+```python
+_DIRECTORY_CACHE: dict[tuple[str, str], DirectoryListing] = {}
+_SEARCH_INDEX_CACHE: dict[str, list[FileItem]] = {}
+```
+
+The cache is invalidated after every mutation that can change metadata:
+
+```python
+def _invalidate_metadata_cache(root: Path) -> None:
+    root_key = str(root)
+    for key in [key for key in _DIRECTORY_CACHE if key[0] == root_key]:
+        del _DIRECTORY_CACHE[key]
+    _SEARCH_INDEX_CACHE.pop(root_key, None)
+```
+
+Practical tradeoff:
+
+- Good enough for a single-process local service.
+- Fast and simple.
+- Not durable and not shared across multiple Uvicorn workers.
+
+Revisit when search, trash restore, audit history, or multi-process deployment needs durable state. SQLite should be the first upgrade path.
+
+### Search Index
+
+Search is metadata-only and built from the filesystem. The index excludes trash and returns matching file/folder metadata.
+
+Current behavior:
+
+- Search matches against `name` and API `path`.
+- Results are limited.
+- Index is rebuilt after cache invalidation.
+- No raw file contents are indexed.
+
+Theory:
+
+Search indexing is separate from file storage. The filesystem remains source of truth; the index is only an acceleration structure.
+
+### Streaming And Archive Downloads
+
+Downloads, previews, and folder archives are streamed through FastAPI and proxied by Next.js.
+
+For normal files:
+
+```python
+return FileResponse(path=target, filename=target.name)
+```
+
+For folder archive download:
+
+```python
+with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+    for child in target.rglob("*"):
+        archive.write(child, child.relative_to(target.parent))
+```
+
+The archive is generated server-side so compression still respects root-bound path validation. Temporary ZIP files are cleaned after the response through a background task.
+
+### Preview Model
+
+Preview support is decided by FastAPI, not the frontend. The UI asks `preview-info` first, then renders only supported browser-native types.
+
+Supported v1 preview kinds:
+
+- image
+- video
+- audio
+- PDF
+- text/code below the configured size limit
+
+Unsupported files show metadata and download action. There is no Office conversion, thumbnail generation pipeline, or raw file content cache yet.
+
+### Finder-Style UI
+
+The current UI is intentionally modeled more like macOS Finder than a web admin table:
+
+- desktop root folder
+- explorer window with sidebar
+- grid, compact, and details views
+- right-click and three-dot context menus
+- multi-select and keyboard shortcuts
+- floating preview overlay
+- background and motion controls
+
+Practical reason: file management is a spatial task. A familiar desktop model reduces friction compared with a CRUD table.
+
+### Current API Contract
+
+FastAPI internal API:
+
+```http
+GET    /health
+GET    /api/files?path=
+GET    /api/files/search?query=
+POST   /api/folders
+POST   /api/files/upload
+GET    /api/files/download?path=
+GET    /api/files/archive?path=
+GET    /api/files/preview?path=
+GET    /api/files/preview-info?path=
+PATCH  /api/files/rename
+POST   /api/files/copy
+POST   /api/files/move
+DELETE /api/files?path=
+```
+
+Next.js browser-facing BFF routes mirror these storage operations under `/api/storage/*` and add `/api/session/login` plus `/api/session/logout`.
+
+## Interview Explanation
+
+### Problem
+
+I had an unused secondary PC with spare disk capacity. Instead of treating it as wasted hardware, I built a private cloud appliance that exposes one safe storage root to my own devices.
+
+### Constraints
+
+- The machine may reboot, sleep, or be physically remote.
+- The app must not expose the whole filesystem.
+- Large files should stream rather than load into memory.
+- The browser should not know backend service secrets.
+- V1 should be usable locally before adding cloud or sync complexity.
+
+### Key Tradeoffs
+
+- FastAPI over Node-only backend: better local filesystem and automation story.
+- Next.js BFF over direct browser-to-FastAPI calls: cleaner session and token boundary.
+- Tailscale over public port forwarding: smaller attack surface.
+- In-memory metadata cache over SQLite first: faster progress, simpler deployment.
+- Soft delete over hard delete: safer personal storage behavior.
+- Browser-native preview over conversion pipeline: useful coverage without heavyweight processing.
+
+### Scaling Path
+
+The project can grow in layers:
+
+1. In-memory metadata cache.
+2. SQLite metadata/search/trash/audit state.
+3. Windows watchdog and startup reliability.
+4. Tailscale hardening and device setup guide.
+5. One-way backup.
+6. Manual cloud inbox with chunk manifests and hash verification.
+
+### Failure Modes To Discuss
+
+- FastAPI token leak: rotate token, keep it out of browser, consider mTLS later.
+- Cache stale after mutation: invalidate root cache on every write operation.
+- Disk full: add preflight checks before upload/archive/chunk import.
+- Symlink escape: resolve final path and prove it remains under root.
+- Partial uploads: current multipart is not resumable; future cloud inbox uses chunk manifests.
+- Trash growth: add retention cleanup and restore metadata.
+
 ## Decision Log
 
 ### Decision: Python/FastAPI For Storage Backend
